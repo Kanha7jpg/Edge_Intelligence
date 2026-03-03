@@ -1,0 +1,38 @@
+{
+    "NODE_A": {
+        "ip": "192.168.1.10",
+        "port": 5000,
+        "neighbors": [
+            "NODE_B",
+            "NODE_C",
+            "NODE_D"
+        ]
+    },
+    "NODE_B": {
+        "ip": "192.168.1.11",
+        "port": 5000,
+        "neighbors": [
+            "NODE_A",
+            "NODE_C",
+            "NODE_D"
+        ]
+    },
+    "NODE_C": {
+        "ip": "192.168.1.12",
+        "port": 5000,
+        "neighbors": [
+            "NODE_A",
+            "NODE_B",
+            "NODE_D"
+        ]
+    },
+    "NODE_D": {
+        "ip": "192.168.1.13",
+        "port": 5000,
+        "neighbors": [
+            "NODE_A",
+            "NODE_B",
+            "NODE_C"
+        ]
+    }
+}
