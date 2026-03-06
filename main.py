@@ -77,10 +77,10 @@ class CognitiveMeshNode:
             if local_data is not None:
                 fused_vector = self.fusion_engine.fuse(local_data['features'], incoming_vector)
                 self.memory.put(global_id, fused_vector, time.time())
-                self.ui.log(f"Fused intelligence for {global_id}")
+                self.ui.log(f"FUSED: {global_id[:8]}")
             else:
                 self.memory.put(global_id, incoming_vector, time.time())
-                self.ui.log(f"Stored NEW intelligence for {global_id}")
+                self.ui.log(f"NEW DB: {global_id[:8]}")
 
     def start_stimulus_simulation(self):
         if self.sim_thread and self.sim_thread.is_alive():
