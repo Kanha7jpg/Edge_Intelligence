@@ -110,6 +110,11 @@ class P2PNode:
                     
                 # Decode JSON
                 payload = json.loads(msg_data.decode('utf-8'))
+                
+                # Fix distributed routing by resolving 0.0.0.0 to the actual socket IP
+                if payload.get("sender_host") == "0.0.0.0":
+                    payload["sender_host"] = addr[0]
+                    
                 self._process_incoming_payload(payload)
                 
             except Exception as e:
