@@ -162,7 +162,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5001)
-    parser.add_argument("--source", default="1", help="Path to video or image directory")
+    parser.add_argument("--source", default="0", help="Path to video or image directory")
     args = parser.parse_args()
     
     node = CognitiveMeshNode(args.host, args.port, args.source)
