@@ -1,0 +1,410 @@
+# EdgeIntelligence: A Decentralised Cognitive Mesh for Real-Time Multi-Node Person Tracking
+
+**Case Study Report**
+**Subject:** Distributed Systems & Edge Computing
+**Date:** March 2026
+
+---
+
+
+## 1. Project Overview
+
+**EdgeIntelligence** is a fully decentralised, peer-to-peer (P2P) distributed system that performs real-time person tracking across multiple edge camera nodes — with **no central server**. Each node independently runs a computer vision pipeline and shares extracted intelligence across the mesh network, collaborating to build a unified view of all tracked identities.
+
+The system is inspired by real-world challenges in surveillance, retail analytics, and campus security where deploying a central server is either infeasible, expensive, or a single point of failure.
+
+> [!IMPORTANT]
+> Every node in the mesh is both a producer and consumer of intelligence. There is no master node by design. Leadership is dynamically elected using a distributed consensus algorithm.
+
+---
+
+## 2. Problem Statement
+
+Traditional multi-camera person tracking systems rely on a **centralised architecture**: all video feeds are routed to a single powerful server that performs detection, tracking, and re-identification. This model has critical weaknesses:
+
+| Problem | Centralised System | EdgeIntelligence |
+|---|---|---|
+| **Single Point of Failure** | Entire system fails if server goes down | Nodes continue operating independently |
+| **Network Bandwidth** | Full video streams sent to server | Only 512-float feature vectors exchanged |
+| **Scalability** | Server becomes bottleneck | Each node adds compute capacity |
+| **Latency** | High — must reach central server | Low — processing happens at the edge |
+| **Re-ID on Handoff** | Requires shared DB with central server | Mesh nodes share memory collaboratively |
+
+**Goal:** Build a system where multiple cameras can independently detect people, extract compact mathematical "fingerprints" of their appearance, and share those fingerprints over a P2P mesh — so that if one camera sees a person and another camera later sees the same person, they can **recognise and re-identify** them using only the shared fingerprint, without ever sharing raw video.
+
+---
+
+## 3. System Architecture
+
+The system follows a layered architecture with clear separation of concerns:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   UI Layer (dashboard.py)                │
+│     Nerve Center — Real-time logs, video feed, stats    │
+└────────────────────────┬────────────────────────────────┘
+                         │ UI Callbacks
+┌────────────────────────▼────────────────────────────────┐
+│                 Orchestrator (main.py)                   │
+│              CognitiveMeshNode — wires all layers        │
+└───────┬──────────────────────────────────┬──────────────┘
+        │                                  │
+┌───────▼────────┐               ┌─────────▼──────────────┐
+│  Core Layer    │               │    Network Layer        │
+│                │               │                         │
+│  ┌──────────┐  │               │  ┌───────────────────┐  │
+│  │ MLEngine │  │               │  │    P2PNode        │  │
+│  └──────────┘  │               │  │  ┌─────────────┐  │  │
+│  ┌──────────┐  │               │  │  │ MsgQueue    │  │  │
+│  │FeatureEx │  │◄──────────────│  │  └─────────────┘  │  │
+│  └──────────┘  │  Broadcast /  │  │  ┌─────────────┐  │  │
+│  ┌──────────┐  │  Receive      │  │  │ BullyElect  │  │  │
+│  │ ReIDTrack│  │  Intelligence │  │  └─────────────┘  │  │
+│  └──────────┘  │               │  │  ┌─────────────┐  │  │
+│  ┌──────────┐  │               │  │  │ VectorCommit│  │  │
+│  │ Fusion   │  │               │  │  └─────────────┘  │  │
+│  └──────────┘  │               │  └───────────────────┘  │
+│  ┌──────────┐  │               └─────────────────────────┘
+│  │LRUMemory │  │
+│  └──────────┘  │               ┌─────────────────────────┐
+└────────────────┘               │    Data Layer           │
+                                 │  StimulusLoader         │
+                                 │  (video / webcam / dir) │
+                                 └─────────────────────────┘
+```
+
+### Key Design Choices
+- **No central broker** — Nodes discover peers manually or passively (via incoming messages).
+- **Binary vector payloads** — Only compact 512-dimensional float arrays are transmitted, not raw images.
+- **Event-driven UI** — The UI receives all updates via a thread-safe callback queue.
+- **Store-and-Forward** — If a peer is temporarily offline, messages are held in a per-peer queue and delivered when the peer reconnects.
+
+---
+
+## 4. Module-by-Module Breakdown
+
+### 4.1 Core — ML Engine (YOLOv8)
+**File:** [core/ml_engine.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/ml_engine.py)
+
+The [MLEngine](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/ml_engine.py#5-45) class wraps the **YOLOv8s** (small) model from [Ultralytics](https://github.com/ultralytics/ultralytics). It is responsible for the first stage of the pipeline: detecting people in each video frame.
+
+- **Model:** [yolov8s.pt](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/yolov8s.pt) — pre-trained on the COCO dataset.
+- **Target class:** Class 0 (person) only — all other detections are discarded.
+- **Output:** A list of bounding boxes [(x1, y1, x2, y2, confidence)](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/tests/test_distributed.py#51-55) for each detected person.
+- **Padded Crop:** A helper method [get_padded_crop()](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/ml_engine.py#30-45) extracts the bounding box region from the frame with a configurable pixel padding, used to feed into the feature extractor.
+
+```python
+# Runs YOLOv8 on a frame, returns [detected_persons]
+detections = self.ml_engine.process_frame(frame)
+```
+
+### 4.2 Core — Feature Extractor (ResNet-18)
+**File:** [core/feature_extractor.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/feature_extractor.py)
+
+The [FeatureExtractor](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/feature_extractor.py#8-60) converts a detected person's image crop into a compact, fixed-length **512-dimensional feature vector** (a "feature ghost"). This vector numerically encodes the person's appearance.
+
+- **Backbone:** `ResNet-18`, pre-trained on ImageNet.
+- **Modification:** The final fully-connected classification layer is **removed**, leaving the 512-D feature embedding layer as the output.
+- **Normalization:** The output vector is **L2-normalized** to unit length, making it suitable for cosine similarity comparisons.
+- **Preprocessing:** Standard ImageNet normalization is applied (resize → center crop → normalise).
+- **Device:** Automatically uses GPU (CUDA) if available; falls back to CPU.
+
+> [!NOTE]
+> L2 normalization is critical. By ensuring all vectors have a length of 1.0, the cosine similarity between two vectors becomes simply their **dot product** — making matching extremely fast and computationally cheap.
+
+### 4.3 Core — Re-ID Tracker (Cosine Similarity)
+**File:** [core/tracker.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/tracker.py)
+
+The [ReIDTracker](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/tracker.py#3-42) implements **Re-Identification**: given a new feature vector, find whether this person is already known in the memory cache.
+
+- **Algorithm:** For each vector in memory, computes the dot product against the incoming vector (cosine similarity since both are L2-normalized).
+- **Threshold:** A configurable `similarity_threshold` (default **0.85**) determines the minimum similarity required for a match.
+- **Output:** Returns the best-matching `global_id` and its similarity score. Returns `None` if no match crosses the threshold.
+
+```
+similarity = vec1 · vec2   (dot product of L2-normalized vectors = cosine similarity)
+```
+
+### 4.4 Core — Feature Fusion Engine (EMA)
+**File:** [core/fusion.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/fusion.py)
+
+The [FeatureFusion](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/fusion.py#3-29) engine updates a stored identity's feature vector when it is seen again. Instead of replacing the old vector, it uses an **Exponential Moving Average (EMA)**, which smoothly blends old and new information.
+
+```
+fused = (1 - α) × existing + α × new
+```
+
+- **α (alpha) = 0.3** — Gives 70% weight to the existing stable representation and 30% to the new observation.
+- After blending, the result is **re-normalized** to unit length to maintain the L2 property used by the tracker.
+- This makes the system **robust to slight appearance changes** (lighting, pose) while retaining the core identity.
+
+### 4.5 Core — LRU Memory Cache
+**File:** [core/memory.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/memory.py)
+
+The [LRUMemory](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/memory.py#4-50) is the node's local Re-ID database. It stores up to `max_size` (default: **100**) identities using a **Least Recently Used (LRU)** eviction policy.
+
+- **Backing data structure:** Python's `collections.OrderedDict`, which maintains insertion order and supports `move_to_end()`.
+- **Eviction:** When the cache is full, the **least recently accessed** identity is automatically removed to make room for new ones.
+- **Thread safety:** All read/write operations are protected by a `threading.Lock()`.
+- **Stores per identity:** The 512-D feature vector and a `last_seen` Unix timestamp.
+
+### 4.6 Network — P2P Node
+**File:** [network/p2p_node.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/p2p_node.py)
+
+The [P2PNode](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/p2p_node.py#12-268) is the heart of the distributed system. It manages all networking concerns:
+
+- **TCP Server:** A listening socket accepts connections from any peer. Each connection is handled in a dedicated daemon thread.
+- **Length-Prefixed Framing:** Every message is prefixed with a 4-byte big-endian integer indicating the message length. This fully solves TCP fragmentation — messages are always received completely.
+- **Passive Peer Discovery:** When a message arrives from an unknown sender, the node automatically adds them as a peer (using host/port in the payload header).
+- **Lamport Clock:** The node maintains a logical clock ([lamport_clock](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/tests/test_distributed.py#9-44) integer). It increments on every **send** and applies `max(local, received) + 1` on every **receive**.
+- **Queue Flush Loop:** A background thread ([_queue_flush_loop](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/p2p_node.py#189-243)) runs every second, attempting to flush per-peer message queues to connected peers. If a peer is down, the queue retains messages.
+- **Election Integration:** If the current coordinator (leader) becomes unreachable, the [BullyElection](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/election.py#4-90) engine is automatically triggered.
+- **UI Callback System:** All events (logs, clock updates, coordinator changes, queue status) are emitted to the UI via a non-blocking callback mechanism.
+
+### 4.7 Network — Thread-Safe Message Queue (Store-and-Forward)
+**File:** [network/message_queue.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/message_queue.py)
+
+Each peer in the system has its own [ThreadSafeQueue](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/message_queue.py#4-33). This implements the **Store-and-Forward** routing pattern:
+
+1. When intelligence is broadcast, it is **enqueued** per-peer immediately.
+2. A background thread tries to **flush** the queue when the peer is reachable.
+3. If delivery fails (peer offline), messages **remain in the queue** for the next attempt.
+
+This makes the system **tolerant of transient network partitions** — messages are not lost just because a peer is temporarily unreachable.
+
+### 4.8 Network — Vector Commitment (SHA-256 Security)
+**File:** [network/security.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/security.py)
+
+The [VectorCommitment](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/security.py#4-26) class provides **cryptographic data integrity** for all intelligence transmitted across the mesh.
+
+- **Mechanism:** Before broadcasting, a SHA-256 hash is computed over the JSON representation of `{global_id, timestamp, feature_vector}`.
+- **Verification:** When a node receives a payload, it recomputes the hash and compares it against the transmitted hash.
+- **Tamper Detection:** Any modification to the feature vector or metadata during transit will cause hash mismatch, and the payload is **rejected** with a "Tampering detected!" log.
+
+> [!WARNING]
+> Without this mechanism, a malicious node could inject false identities or corrupt feature vectors, poisoning the shared Re-ID database across the entire mesh.
+
+### 4.9 Network — Bully Election Algorithm
+**File:** [network/election.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/election.py)
+
+The [BullyElection](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/election.py#4-90) class implements the classic **Bully Algorithm** for distributed leader election. The leader (coordinator) node is responsible for coordinating the mesh — if it fails, a new one must be automatically elected.
+
+**How it decides who leads:** The node with the **highest port number** wins (acts as a unique node ID proxy in this implementation).
+
+**Protocol steps:**
+1. **Node initiates** an election by sending `ELECTION` messages to all nodes with a **higher port**.
+2. If **no higher node responds** within 3 seconds → the initiator **declares victory**.
+3. A higher node receiving `ELECTION` replies with `OK` and **starts its own election**.
+4. The winner broadcasts a `VICTORY` message to all peers.
+5. All nodes update their [coordinator](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/ui/dashboard.py#150-152) field upon receiving `VICTORY`.
+
+**Fault Tolerance:** If the coordinator's connection is lost (detected in the queue flush loop), a new election is automatically triggered.
+
+### 4.10 UI — Nerve Center Dashboard
+**File:** [ui/dashboard.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/ui/dashboard.py)
+
+The [NerveCenterUI](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/ui/dashboard.py#8-163) is a modern desktop GUI built with **CustomTkinter** (a themed extension of Tkinter). It provides a real-time operational view of the node:
+
+| Panel | Content |
+|---|---|
+| **Top Control Bar** | Add Peer (IP:Port input), Start Stimulus button |
+| **Status Bar** | Live **Lamport Clock** counter (green), current **Coordinator** node (blue) |
+| **Video Feed** | Real-time annotated camera frame with bounding boxes |
+| **Re-ID Gallery** | Scrollable log of all successful identity matches with similarity score |
+| **Activity Log** | Network events, errors, new identity discoveries |
+| **Peer Queues Panel** | Per-peer queue depth, updated every second |
+
+**Thread Safety:** All UI updates are submitted via a `queue.Queue` (the [ui_queue](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/ui/dashboard.py#26-37)) and processed on the main Tkinter thread every 50ms via `self.after(50, ...)`. This prevents cross-thread Tkinter access violations.
+
+### 4.11 Data — Stimulus Loader
+**File:** [data/stimulus_loader.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/data/stimulus_loader.py)
+
+The [StimulusLoader](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/data/stimulus_loader.py#4-54) is a flexible input abstraction that handles three types of stimulus sources:
+
+| Source Type | Example | Behaviour |
+|---|---|---|
+| **Integer / digit string** | `0`, `1`, `"0"` | Opens OpenCV `VideoCapture(0)` — live webcam |
+| **Video file** | `data/sample.mp4` | Streams frames from MP4 |
+| **Image directory** | `data/frames/` | Reads sorted JPG/PNG files one-by-one |
+
+The [reset()](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/data/stimulus_loader.py#50-54) method allows the system to loop gracefully when the stimulus is exhausted (e.g., for video files and image directories).
+
+---
+
+## 5. Distributed Algorithms in Detail
+
+### 5.1 Lamport Logical Clocks
+
+**Problem:** In a distributed system with no shared clock, how do you establish the **causal ordering** of events?
+
+**Solution (Leslie Lamport, 1978):** Assign a logical timestamp to every event. The rules are:
+
+1. Each node maintains a counter, starting at 0.
+2. **On SEND:** Increment clock by 1. Attach the clock value to the message.
+3. **On RECEIVE:** Set `clock = max(local_clock, received_clock) + 1`.
+
+**In EdgeIntelligence:**
+- Implemented inside [P2PNode](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/p2p_node.py#12-268) ([lamport_clock](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/tests/test_distributed.py#9-44) integer).
+- Every call to [broadcast_intelligence()](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/p2p_node.py#162-188) increments the clock.
+- Every received intelligence payload reads the embedded `lamport_ts` and updates the clock.
+- The current clock value is pushed to the UI via the `CLOCK` callback.
+
+**What it enables:** Nodes can determine whether one "intelligence broadcast" event happened **before** or **after** another, even without synchronized real-time clocks.
+
+```
+Event A (Node A sends, clock=1) → Event B (Node B receives, clock=2)
+```
+
+### 5.2 Bully Algorithm for Leader Election
+
+**Problem:** The system needs a designated coordinator for orchestration. If that coordinator fails, the system must automatically elect a new one **without human intervention**.
+
+**Why "Bully"?** The node with the **highest ID** (port number) always wins — it "bullies" its way to the top.
+
+**State Machine:**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> ElectionOngoing : peer failure detected OR new peer added
+    ElectionOngoing --> WaitingForOK : ELECTION msgs sent to higher nodes
+    WaitingForOK --> Victory : 3s timeout, no OK received
+    WaitingForOK --> Idle : OK received (a higher node will win)
+    Victory --> Coordinator : broadcast VICTORY to all peers
+    Coordinator --> ElectionOngoing : coordinator unreachable
+```
+
+**Message Types:**
+- `ELECTION` — "I am starting an election."
+- `OK` — "I am alive and higher than you; step down."
+- `VICTORY` — "I am the new coordinator."
+
+**Fault Tolerance Proof:**
+- If the highest node (leader) dies → its queue flush fails → `PEER_DOWN` event → `election_engine.start_election()` → next highest node wins.
+- Verified in [tests/test_distributed.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/tests/test_distributed.py): killing Node 7003 causes Node 7002 to be elected.
+
+---
+
+## 6. End-to-End Data Flow
+
+The following trace describes what happens from camera frame to mesh-wide intelligence:
+
+```
+1. StimulusLoader.get_next_frame()
+       │
+       ▼ Raw video frame (numpy array, BGR)
+2. MLEngine.process_frame(frame)
+       │
+       ▼ List of bounding boxes [(x1,y1,x2,y2,conf), ...]
+3. MLEngine.get_padded_crop(frame, bbox)
+       │
+       ▼ Cropped person image (numpy array)
+4. FeatureExtractor.extract_features(crop)
+       │
+       ▼ 512-D L2-normalized float vector ("feature ghost")
+5. ReIDTracker.match(vector, memory)
+       │
+       ├─── MATCH FOUND ───► Fuse with LRUMemory.get() using FeatureFusion.fuse()
+       │                     Update LRUMemory.put() with fused vector
+       │                     Log match to UI
+       │
+       └─── NO MATCH ──────► Assign new UUID as global_id
+                             LRUMemory.put(new_id, vector)
+                             Log "New Identity Captured" to UI
+       │
+       ▼ (Either path leads here)
+6. P2PNode.broadcast_intelligence(global_id, fused_vector, timestamp)
+       │   Lamport clock incremented
+       │   Payload = {global_id, timestamp, lamport_ts, sender_host, sender_port, vector, SHA-256 hash}
+       │
+       ▼ Message enqueued in each peer's ThreadSafeQueue
+7. _queue_flush_loop() (background thread, every 1 second)
+       │   Connect to peer (if not connected)
+       │   Flush all queued messages over TCP
+       │
+       ▼ Received by peer's P2PNode._handle_client()
+8. VectorCommitment.verify_commitment() → reject if hash mismatch
+       │
+       ▼ Valid payload
+9. Lamport clock updated: max(local, received) + 1
+       CLOCK callback → UI clock display updated
+       PULSE callback → CognitiveMeshNode merges or stores in its LRUMemory
+       QUEUE_STATUS callback → UI queue panel updated
+```
+
+---
+
+## 7. Software Engineering Principles Applied
+
+| Principle | Application in this Project |
+|---|---|
+| **Single Responsibility Principle** | Each class has one job: [MLEngine](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/ml_engine.py#5-45) detects, [FeatureExtractor](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/feature_extractor.py#8-60) embeds, [ReIDTracker](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/tracker.py#3-42) matches, [P2PNode](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/p2p_node.py#12-268) networks. None overlap. |
+| **Open/Closed Principle** | [StimulusLoader](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/data/stimulus_loader.py#4-54) is open for extension (new source types) without modifying existing logic. |
+| **Abstraction / Information Hiding** | [P2PNode](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/p2p_node.py#12-268) hides all TCP, framing, and queue details behind [broadcast_intelligence()](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/p2p_node.py#162-188) and [add_peer()](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/main.py#53-55). |
+| **Separation of Concerns** | `core/`, [network/](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/main.py#56-93), [ui/](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/ui/dashboard.py#38-93), and `data/` are strictly separated. The UI doesn't know about sockets; the network layer doesn't know about YOLO. |
+| **Event-Driven Architecture** | The [ui_callback](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/tests/test_p2p.py#8-10) pattern decouples the network and core layers from the UI. The UI is purely reactive. |
+| **Thread Safety** | [LRUMemory](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/core/memory.py#4-50), [ThreadSafeQueue](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/message_queue.py#4-33), and [NerveCenterUI](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/ui/dashboard.py#8-163) all use locks and queues to prevent race conditions across concurrent threads. |
+| **Fault Tolerance** | Store-and-forward queues survive peer disconnections. Bully election survives coordinator failure. |
+| **Cryptographic Integrity** | SHA-256 commitments ensure data has not been tampered with in transit. |
+| **DRY (Don't Repeat Yourself)** | The [ui_callback](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/tests/test_p2p.py#8-10) is a single unified channel for all events from the network layer to the UI, rather than multiple disparate function calls. |
+
+---
+
+## 8. Testing Strategy
+
+### Unit Tests — [tests/test_p2p.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/tests/test_p2p.py)
+
+| Test Case | What it Verifies |
+|---|---|
+| **Fusion Math Test** | `FeatureFusion.fuse()` produces an L2-normalized output. Verified that `‖fused‖ = 1.0` with `numpy.isclose`. |
+| **Store-and-Forward Test** | Node A queues a message when Node B is offline (`qsize == 1`). After Node B starts, the queue flushes to 0. |
+
+### Integration Tests — [tests/test_distributed.py](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/tests/test_distributed.py)
+
+| Test Case | What it Verifies |
+|---|---|
+| **Lamport Clock Test** | Start two nodes, send one message from A→B. Verify clock event `1` (A's send) and clock event `2` (B's receive = max(0,1)+1) are both emitted. |
+| **Bully Election — Initial** | Start 3 nodes (ports 7001, 7002, 7003). After election, all nodes must agree that port **7003** is the coordinator. |
+| **Bully Election — Fault Tolerance** | Kill node 7003. Wait for re-election. All surviving nodes must agree that **7002** is the new coordinator. |
+
+> [!TIP]
+> Run the tests from the project root:
+> ```powershell
+> $env:PYTHONPATH="."
+> python tests\test_p2p.py
+> python tests\test_distributed.py
+> ```
+
+---
+
+## 9. Technology Stack
+
+| Category | Technology | Purpose |
+|---|---|---|
+| **Language** | Python 3.8+ | All components |
+| **Object Detection** | YOLOv8s (`ultralytics`) | Person detection in video frames |
+| **Feature Embedding** | ResNet-18 (`torchvision`) | 512-D appearance fingerprinting |
+| **Tensor Operations** | PyTorch + NumPy | Model inference, vector math |
+| **Networking** | Python `socket` (TCP) | Raw P2P communication |
+| **Image Processing** | OpenCV (`opencv-python`) | Frame reading, BGR↔RGB, cropping |
+| **GUI** | CustomTkinter | Modern dark-themed desktop UI |
+| **Security** | Python `hashlib` (SHA-256) | Vector integrity verification |
+| **Concurrency** | `threading`, [queue](file:///c:/Users/kanha/Documents/GitHub/EdgeIntelligence/network/message_queue.py#13-16) | Multi-threaded server, UI safety |
+
+---
+
+## 10. Conclusion
+
+EdgeIntelligence demonstrates that **complex distributed systems** can be built from first principles in Python by carefully combining:
+
+1. **Edge-native computer vision** — YOLO + ResNet at the camera, not in the cloud.
+2. **Distributed consensus algorithms** — Bully Election for automatic fault-tolerant leadership.
+3. **Causal ordering** — Lamport Clocks for cross-node event consistency.
+4. **Resilient messaging** — Store-and-Forward queues for network partition tolerance.
+5. **Cryptographic integrity** — SHA-256 commitments to prevent data poisoning.
+
+The system successfully solves the problem of **cross-camera Re-Identification without a central server**, exchanging only compact 512-float mathematical representations instead of raw video streams. This approach is bandwidth-efficient, scalable, and fault-tolerant — making it suitable for real-world edge deployment in security, retail, and smart city applications.
+
+---
+
+*Document prepared for academic faculty review — EdgeIntelligence Project, March 2026.*
